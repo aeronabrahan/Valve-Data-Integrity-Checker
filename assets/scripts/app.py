@@ -378,10 +378,12 @@ try:
             if range_pattern:
                 start_psi = int(range_pattern.group(1))
                 end_psi = int(range_pattern.group(3))
-                step = 10 if (end_psi - start_psi) % 10 == 0 else 5
-                required_range = list(range(start_psi, end_psi + 1, step))
+                if start_psi == end_psi:
+                    required_range = [start_psi]
+                else:
+                    step = 10 if (end_psi - start_psi) % 10 == 0 else 5
+                    required_range = list(range(start_psi, end_psi + 1, step))
 
-                # Extract all 2–3 digit-like strings
                 possible_numbers = re.findall(r'\b([\dOIlS]{2,4})\b', full_pdf_text)
                 cleaned_numbers = []
                 for val in possible_numbers:
@@ -392,11 +394,13 @@ try:
                         continue
 
                 matched = [val for val in required_range if val in cleaned_numbers]
-                match_ratio = len(matched) / len(required_range)
-                if match_ratio >= 1.0:
-                    range_match = True
-                elif match_ratio >= 0.6:
-                    range_partial_match = True
+                if required_range:
+                    match_ratio = len(matched) / len(required_range)
+                    if match_ratio >= 1.0:
+                        range_match = True
+                    elif match_ratio >= 0.6:
+                        range_partial_match = True
+
             fuzzy_score = fuzz.token_set_ratio(expected_value_clean, full_pdf_text)
 
             # Spelling variant mismatch detection
