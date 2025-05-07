@@ -1,0 +1,28 @@
+# Theme and Plugins
+remote_theme: pages-themes/midnight@v0.2.0
+plugins:
+ - jekyll-remote-theme
+# Repository Metadata
+title: "Valve Data Integrity Checker"
+description: "AI-driven tool for validating valve product specifications using OCR, NLP, and computer vision."
+author: "Jan Aeron Abrahan"
+github_username: "aeronabrahan"
+# Navigation Settings
+show_downloads: true
+include:
+ - README.md
+ - assets/datasets
+ - assets/images
+ - assets/pbi
+# Repository Settings
+repository: "aeronabrahan/Valve-Data-Integrity-Checker"
+url: "https://github.com/aeronabrahan/Valve-Data-Integrity-Checker"
+# SEO and Social Sharing
+social:
+ name: "Jan Aeron Abrahan"
+ links:
+   - "https://github.com/aeronabrahan"
+   - "https://linkedin.com/in/jagabrahan"
+# Custom Options
+markdown: kramdown
+permalink: pretty
