@@ -10,8 +10,11 @@ from fuzzywuzzy import fuzz
 from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+from urllib.parse import urljoin
 from torchvision import transforms
+from type import detect_product_type
 import matplotlib.backends.backend_pdf
+from name import apollo
 from pdf2image import convert_from_path
 from torchvision.models import resnet50, ResNet50_Weights
 from sentence_transformers import SentenceTransformer, util
@@ -47,23 +50,57 @@ def normalize_size(s):
     return s
 
 def extract_product_benefits_or_features(text):
-    results = []
-    for header in ["benefits", "features"]:
-        match = re.search(rf'(?i){header}\s*[:\n\-\u2013\u2014]*([\s\S]{{0,1000}})', text)
-        if not match: continue
-        lines = match.group(1).splitlines()
-        points = []
-        for line in lines:
-            line = line.strip("\u2022*-\u2013\u2014:\n ")
-            if not line or re.match(r'^[A-Z][a-zA-Z\s]{1,30}$', line): break
-            for item in re.split(r'(?<=[.;|])\s+|\u2022|\n|(?<!\d)-(?!\d)', line):
-                item = item.strip()
-                if len(item) > 3 and not item.lower().startswith("www"): points.append(f"{item}")
-        if points: results.append((header.title(), points))
-    return results
+    features = []
+    lines = text.splitlines()
+
+    capture = False
+    max_lines = 25
+    captured_lines = 0
+
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+
+        # Detect start of FEATURES section
+        if not capture and re.search(r'\bfeatures\b', line_stripped, re.IGNORECASE):
+            capture = True
+            continue
+
+        # Stop at next known section header
+        if capture and any(
+            re.match(rf"^{s}[:\s]*$", line_stripped, re.IGNORECASE)
+            for s in ["options", "performance rating", "standard materials", "precautionary note", "description"]
+        ):
+            break
+
+        if capture:
+            cleaned = line_stripped.strip("•*- \u2022").strip()
+            if 3 < len(cleaned) < 150:
+                features.append(cleaned.capitalize())
+            captured_lines += 1
+            if captured_lines > max_lines:
+                break
+
+    # Fallback: inline FEATURES section (e.g., "features • item1 • item2 ...")
+    if not features:
+        inline_match = re.search(
+            r'features\s*[:\-]?\s*(.+?)(options|performance rating|standard materials|description|precautionary note|see installation manual)',
+            text,
+            re.IGNORECASE | re.DOTALL
+        )
+        if inline_match:
+            feature_blob = inline_match.group(1)
+            parts = re.split(r'•|\n| - |\s{2,}', feature_blob)
+            for item in parts:
+                item_clean = item.strip("•*- \u2022").strip()
+                if 3 < len(item_clean) < 150:
+                    features.append(item_clean.capitalize())
+
+    return [("Features", features)] if features else []
+
 
 def render_benefits_and_features_section(full_pdf_text):
     benefit_feature_sections = extract_product_benefits_or_features(full_pdf_text)
+
     if benefit_feature_sections:
         for section_name, items in benefit_feature_sections:
             st.markdown(f"### 💡 Product {section_name}")
@@ -71,14 +108,15 @@ def render_benefits_and_features_section(full_pdf_text):
                 st.write(f"- {item}")
     else:
         st.markdown("### 💡 Product Features")
-        st.info("No specific benefits or features section found in the spec sheets.")
+        st.info("No specific product features section found in the spec sheet.")
 
-def find_best_pdf_link(soup):
-    links = [a for a in soup.find_all("a", href=True, string=True) if a['href'].lower().endswith(".pdf")]
-    for k in ["specif", "specification", "manual", "catalog"]:
+def find_best_pdf_link(soup, base_url):
+    links = [a for a in soup.find_all("a", href=True) if ".pdf" in a['href'].lower()]
+    for keyword in ["specif", "specification", "manual", "catalog"]:
         for tag in links:
-            if k in tag.text.lower(): return tag['href']
-    return links[0]['href'] if links else None
+            if tag.string and keyword in tag.string.lower():
+                return urljoin(base_url, tag['href'])  # fix here
+    return urljoin(base_url, links[0]['href']) if links else None
 
 @st.cache_resource
 def load_embedder():
@@ -123,76 +161,29 @@ def load_resnet(): image_model = resnet50(weights=ResNet50_Weights.DEFAULT); ima
 
 @st.cache_data(show_spinner=False)
 def extract_critical_info_warnings_only(text):
-    warning_keywords = [
-        "not to be used", "not suitable", "do not use", "do not install", "not intended", "not recommended",
-        "avoid use", "warning", "caution", "limitation", "hazard", "danger", "risk of", "expose you to",
-        "prop 65", "cancer", "reproductive harm", "drinking water", "not potable", "flammable", "explosive",
-        "electric shock", "toxic", "corrosive", "chemical exposure", "pressure hazard", "overpressure",
-        "scalding", "p65warnings", "fully open", "fully closed", "temperature", "mounting", "sensitivity",
-        "weight", "damage", "failure", "supply pressure", "psig"
+    warning_patterns = [
+        r'precautionary note[:\-]?\s*(.+?[\.\!](?=\s+[A-Z]|$))',
+        r'\*+\s*lead free[:\-]?\s*(.+?[\.\!](?=\s+[A-Z]|$))',
+        r'(not recommended[^\.!\n]{10,200}[\.\!])',
+        r'(the wetted surfaces of this product shall contain no more than[^\.!\n]{10,200}[\.\!])',
     ]
 
-    results = []
     seen = set()
+    results = []
 
-    # 1. Explicitly extract all 'Note:' or similar patterns (up to period)
-    note_blocks = re.findall(r'(?:\*+\s*)?((?:please\s+)?(?:note|important|caution|kindly\s+note))\s*[:\-–]\s*([^.?!\n]+[.?!])', text, re.IGNORECASE)
-    for label, content in note_blocks:
-        full_sentence = f"{label.strip().capitalize()}: {content.strip()}"
-        if full_sentence.lower() not in seen:
-            results.append(full_sentence)
-            seen.add(full_sentence.lower())
+    for pattern in warning_patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        for match in matches:
+            sentence = match.strip()
 
-    # 2. Extract all other lines with safety-related keywords
-    segments = re.split(r'(?<=[.!?])\s+|\n+', text)
-    for seg in segments:
-        original = seg.strip()
-        lowered = original.lower()
-        if not original:
-            continue
-        if any(kw in lowered for kw in warning_keywords):
-            clean = original[0].upper() + original[1:] if original else original
-            if clean.lower() not in seen:
-                results.append(clean.strip())
-                seen.add(clean.lower())
+            # Ensure only reasonable length and avoid duplicates
+            if 20 < len(sentence) < 300:
+                normalized = sentence[0].upper() + sentence[1:]
+                if normalized.lower() not in seen:
+                    seen.add(normalized.lower())
+                    results.append(f"- {normalized}")
 
-    # Format result list
-    if results:
-        return "\n" + "\n".join(f"- {r}" for r in results)
-    else:
-        return "No warnings detected."
-
-def detect_valve_type(text, title=""):
-    COMMON_VALVE_TYPES = {
-        "Air Filter Regulator": ["air filter regulator", "filter regulator", "instrument air filter", "air filter & regulator"],
-        "Gate Valve": ["gate valve"],
-        "Check Valve": ["check valve"],
-        "Globe Valve": ["globe valve"],
-        "Ball Valve": ["ball valve"],
-        "Relief Valve": ["relief valve", "pressure relief valve"],
-        "Pressure Regulator": ["pressure regulator"],
-        "Needle Valve": ["needle valve"],
-        "Angle Valve": ["angle valve"],
-        "Control Valve": ["control valve"],
-        "Strainer": ["strainer"],
-        "Transducer": ["transducer"],
-        "Flow Control Valve": ["flow control valve"],
-        "Diaphragm Valve": ["diaphragm valve"],
-        "Butterfly Valve": ["butterfly valve"],
-        "Manual Drain": ["manual drain"],
-    }
-
-    combined_text = f"{title.lower()} {text.lower()}"
-    scores = {}
-    for label, keywords in COMMON_VALVE_TYPES.items():
-        score = sum(1 for kw in keywords if re.search(rf"\b{re.escape(kw)}\b", combined_text))
-        if score > 0:
-            scores[label] = score
-    if scores:
-        # Prioritize based on match count, then alphabetical order for stability
-        best_match = max(scores.items(), key=lambda x: (x[1], -len(x[0])))
-        return best_match[0]
-    return "Unknown"
+    return "\n" + "\n".join(results) if results else "No warnings detected."
 
 def keyword_highlights_smart(text, keyword_dict):
     results = []
@@ -281,33 +272,36 @@ if "validation_started" not in st.session_state:
 st.title("🛠️ Valve Data Integrity Checker")
 
 # CSV or URL Option
-st.markdown("<h4>📂 You may input a URL or upload a CSV with 'url' column.</h4>", unsafe_allow_html=True)
-c1, c2, c3 = st.columns([1,1,6.6])
-include_fuzzy, show_mismatches_only, force_ocr = c1.toggle("Include Fuzzy Matches", True), c2.toggle("Show Only Mismatches", False), c3.toggle("Force OCR Extraction", False)
+st.markdown("<h4>📂 You may input a URL or upload a CSV with 'URL' column.</h4>", unsafe_allow_html=True)
 url = st.text_input("Product URL")
-uploaded_csv = st.file_uploader("Or upload CSV with 'url' column", type=["csv"])
+uploaded_csv = st.file_uploader("Or upload CSV with 'URL' column", type=["csv"])
 
 urls = []
 if uploaded_csv is not None:
     try:
         df = pd.read_csv(uploaded_csv)
-        if 'url' in df.columns:
-            urls = df['url'].dropna().tolist()
-        else:
-            st.warning("Uploaded CSV must have a 'url' column.")
+        if 'URL' not in df.columns:
+            st.warning("Uploaded CSV must have a 'URL' column.")
+            st.stop()
+
+        # ✅ Add Brand filter if 'Brand Name' column exists
+        if 'Brand Name' in df.columns:
+            unique_brands = df['Brand Name'].dropna().unique().tolist()
+            selected_brands = st.multiselect("🧯 Filter by Brand Name", options=unique_brands, default=unique_brands)
+
+            # Filter the dataframe based on selected brands
+            df = df[df['Brand Name'].isin(selected_brands)]
+
+        urls = df['URL'].dropna().tolist()
+
     except Exception as e:
         st.error(f"Error reading uploaded CSV: {e}")
+        st.stop()
 elif url:
     urls = [url]
 
-# Add crop sliders for OCR image region
-if force_ocr:
-    st.sidebar.markdown("### Crop Region for OCR Image")
-    for key in ["crop_left", "crop_top", "crop_right", "crop_bottom"]:
-        st.sidebar.slider(f"{key.replace('_', ' ').title()} (0–100%)", 0, 100, st.session_state[key], key=key, on_change=slider_callback)
-
 # Global user keyword input (applies to all URLs in current session)
-default_keywords = "Pressure, Temperature, Flow, Media, Weight, Filter, Material"
+default_keywords = ""
 global_keyword_input = st.text_input("Keywords to look out for (comma-separated)", value=default_keywords, key="global_keyword_input")
 global_keywords = [kw.strip().lower() for kw in global_keyword_input.split(',') if kw.strip()]
 
@@ -350,7 +344,7 @@ def engineering_equiv_normalize(text):
     text = text.lower().replace("minimum", "min.").replace("maximum", "max.")
     text = re.sub(r"\s+", " ", text.replace("–", "-").replace("°", " degrees ")).strip()
     return text
-
+    
 try:
     if not urls:
         st.warning("Please enter at least one product URL.")
@@ -368,8 +362,8 @@ try:
             # Fallback to URL-based name
             name_segment = product_url.split("https://valveman.com/products/")[-1].split("-")[:10]
             readable_name = " ".join(name_segment).strip()
-        st.subheader(f"📌 Results for: {readable_name}")
-        pdf_url = find_best_pdf_link(soup)
+        st.subheader(f"Product Name: {readable_name}")
+        pdf_url = find_best_pdf_link(soup, product_url)
         if not pdf_url:
             st.warning(f"No specification PDF found for {product_url}")
             st.markdown("<hr style='border: 2px solid #bbb;'>", unsafe_allow_html=True)
@@ -380,7 +374,7 @@ try:
         st.markdown(f'<a href="{product_url}" target="_blank" style="text-decoration:none;font-weight:600;">🔗 Product Page Link</a>', unsafe_allow_html=True)
 
         # Detect and display all relevant PDF links horizontally
-        pdf_links = soup.find_all("a", href=True, string=True)
+        pdf_links = soup.find_all("a", href=True)
         pdf_labels_map = {
             "quick start guide": "Quick Start Guide", 
             "instruction" : "Instruction Manual",
@@ -396,7 +390,7 @@ try:
 
         for tag in pdf_links:
             href = tag['href']
-            if href.lower().endswith(".pdf"):
+            if ".pdf" in href.lower():
                 label = "PDF"
                 for keyword, nice_label in pdf_labels_map.items():
                     if keyword in tag.text.lower() or keyword in href.lower():
@@ -405,7 +399,6 @@ try:
                 displayed_links.append((label, href))
 
         if displayed_links:
-            st.markdown("### 📎 Related PDF Documents")
             cols = st.columns(len(displayed_links))
             for i, (label, link) in enumerate(displayed_links):
                 with cols[i]:
@@ -447,12 +440,25 @@ try:
         with open(pdf_path, 'wb') as f:
             f.write(pdf_content)
 
+        # try:
+        #     st.write(f"📥 Downloading PDF: {pdf_url}")
+        #     response = requests.get(pdf_url, timeout=20)  # Set timeout to 20 seconds
+        #     pdf_content = response.content
+
+        #     with open(pdf_path, 'wb') as f:
+        #         f.write(pdf_content)
+
+        # except Exception as e:
+        #     st.error(f"⏳ Failed to fetch PDF for {readable_name}: {e}")
+        #     st.markdown("<hr style='border: 1px solid #ccc;'>", unsafe_allow_html=True)
+        #     continue
+
         # Read PDF text
         doc = fitz.open(pdf_path)
         page_sources = [(i, p.get_text()) for i, p in enumerate(doc)]
         all_pdf_text = [text for _, text in page_sources]
 
-        if force_ocr or not any(all_pdf_text) or all(len(text.strip()) < 20 for text in all_pdf_text):
+        if not any(all_pdf_text) or all(len(text.strip()) < 20 for text in all_pdf_text):
             st.info(f"OCR fallback activated for scanned or unreadable PDF...")
             ocr_text = extract_text_from_image_pdf(pdf_path)
             all_pdf_text = [ocr_text]
@@ -472,8 +478,11 @@ try:
         missing_on_website = pdf_sizes_norm - website_sizes_norm
         missing_in_pdf = website_sizes_norm - pdf_sizes_norm
 
-        detected_valve_type = detect_valve_type(full_pdf_text, title=full_title)
-        st.markdown(f"### Product Type: **{detected_valve_type}**")
+        detected_valve_type = detect_product_type(readable_name)
+        st.markdown(f"### Product Type: **_{detected_valve_type}_**")
+
+        standard_name = apollo(readable_name, full_pdf_text)
+        st.markdown(f"### Proposed Product Name: **_{standard_name}_**")
         
         # Compare specifications
         results = []
@@ -485,7 +494,7 @@ try:
             label_clean = label.strip().lower()
             value_clean = expected_value.strip().lower()
 
-            if label_clean in ["approvals", "rohs"]:
+            if label_clean in ["approvals", "rohs", "specs designed to"]:
                 continue
             expected_value_clean = re.sub(r'\s+', ' ', expected_value.strip().lower())
             normalized_expected = normalize_string(synonym_replace(expected_value_clean))
@@ -579,7 +588,7 @@ try:
                     connection_matches += 1
             connection_match = len(connection_terms) > 0 and connection_matches >= 1
 
-            match_pdf = exact_match or normalized_match or all_sub_matched or semantic_match or connection_match or range_match or range_partial_match or (include_fuzzy and fuzzy_score > 80)
+            match_pdf = exact_match or normalized_match or all_sub_matched or semantic_match or connection_match or range_match or range_partial_match or (True and fuzzy_score > 80)
             if spelling_mismatch:
                 match_pdf = False
 
@@ -612,7 +621,7 @@ try:
                 context_snippet = f"Semantic components found: {semantic_hits} of {semantic_parts_total}"
             elif connection_match:
                 context_snippet = f"Connection terms matched: {connection_matches}"
-            elif fuzzy_score > 80 and include_fuzzy:
+            elif fuzzy_score > 80:
                 match_words = expected_value_clean.split()
                 for i, text in page_sources:
                     for sentence in text.lower().split('.'):
@@ -634,7 +643,7 @@ try:
                 (connection_match, "Connection-type match", "No action required"),
                 (range_match, f"Range values match ({start_psi}–{end_psi}) from OCR scan", "No action required"),
                 (range_partial_match, f"Partial range match ({len(matched)} of {len(required_range)} values found via OCR)", "Visually review PDF for numeric consistency"),
-                (fuzzy_score > 80 and include_fuzzy, f"Fuzzy match ({fuzzy_score}%)", "No action required")
+                (fuzzy_score > 80, f"Fuzzy match ({fuzzy_score}%)", "No action required")
             ]
 
             for cond, note, action in match_cases:
@@ -657,9 +666,6 @@ try:
 
         # Create DataFrame
         result_df = pd.DataFrame(results)
-        if show_mismatches_only:
-            result_df = result_df[result_df["PDF Match"] == False]
-
         styled_df = result_df.style.apply(
             lambda row: ['background-color: rgba(255,0,0,0.1)' if row['PDF Match'] == False and row['Remarks'] == 'Mismatch or missing' else '' for _ in row],
             axis=1
